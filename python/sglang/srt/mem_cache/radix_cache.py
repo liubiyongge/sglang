@@ -659,14 +659,15 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
-            child.hit_count += 1
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                new_node.hit_count += 1
                 value.append(new_node.value)
                 node = new_node
                 break
             else:
+                child.hit_count += 1
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
