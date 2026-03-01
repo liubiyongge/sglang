@@ -432,13 +432,14 @@ class RadixCache(BasePrefixCache):
         key = params.key
         value = params.value
         priority = params.priority
+        chunked = params.chunked
 
         if value is None:
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority)
+        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)
 
     def _page_align_keys(self, key: list) -> list:
@@ -662,12 +663,10 @@ class RadixCache(BasePrefixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                new_node.hit_count += 1
                 value.append(new_node.value)
                 node = new_node
                 break
             else:
-                child.hit_count += 1
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
@@ -699,7 +698,22 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value, priority: int = 0):
+    def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
+        # Skip the hit count update for chunked requests to avoid self-referencing
+        # inflation where a chunked request increments hit_count on nodes it created
+        # in previous chunks.
+        if chunked:
+            return
+        node.hit_count += 1
+
+    def _insert_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        priority: int = 0,
+        chunked: bool = False,
+    ):
         # Convert None priority to 0
         if priority is None:
             priority = 0
@@ -716,7 +730,6 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = access_time
-            node.hit_count += 1
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -725,10 +738,11 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
+                self._inc_hit_count(new_node, chunked)
                 node = new_node
             else:
                 node.priority = max(node.priority, priority)
-
+                self._inc_hit_count(node, chunked)
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
@@ -737,7 +751,7 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            new_node.hit_count = 1
+            self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
