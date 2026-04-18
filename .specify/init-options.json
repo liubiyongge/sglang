@@ -1,0 +1,10 @@
+{
+  "ai": "qodercli",
+  "branch_numbering": "sequential",
+  "context_file": "QODER.md",
+  "here": true,
+  "integration": "qodercli",
+  "preset": null,
+  "script": "sh",
+  "speckit_version": "0.7.4.dev0"
+}

@@ -1,8 +1,32 @@
+"""
+radix_cache.py - 基数树(Radix Tree)缓存实现
+
+本模块实现了基于基数树(Radix Tree/Patricia Tree)的KV缓存管理数据结构。
+基数树是一种压缩的前缀树，用于高效地存储和检索共享前缀的token序列，
+这对于大语言模型的推理优化至关重要，因为多个请求通常共享相同的system prompt或前缀。
+
+主要组件：
+1. RadixKey - 树节点的键，包含token ID序列和可选的额外命名空间键
+2. TreeNode - 树节点，存储KV缓存的索引和元数据
+3. RadixCache - 主缓存类，提供前缀匹配、插入、驱逐等功能
+
+核心优势：
+- 前缀共享：多个请求共享相同前缀时，只需存储一份KV缓存
+- 高效匹配：O(k)时间复杂度匹配最长前缀，k为token数量
+- 内存高效：自动合并共享前缀，减少内存占用
+- 支持多种驱逐策略：LRU、LFU、FIFO、MRU、FILO、Priority
+
+作者: SGLang Team
+版权所有 2023-2024 SGLang Team
+许可证: Apache License 2.0
+"""
+
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
+"""原有版权和许可证声明"""
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,144 +44,304 @@ limitations under the License.
 
 """
 The radix tree data structure for managing the KV cache.
+基数树数据结构，用于管理KV缓存。
 """
 
-import heapq
+# 标准库导入
+import heapq  # 堆队列算法，用于实现优先队列驱逐
 import logging
 import sys
 import time
-from collections import defaultdict
-from functools import lru_cache, partial
+from collections import defaultdict  # 默认字典，用于构建子节点映射
+from functools import lru_cache, partial  # LRU缓存装饰器和偏函数
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
-import torch
+import torch  # PyTorch张量库
 
+# 配置模块日志记录器
 logger = logging.getLogger(__name__)
 
+# 导入KV缓存事件类型，用于分布式场景下的缓存事件通知
 from sglang.srt.disaggregation.kv_events import (
-    MEDIUM_GPU,
-    AllBlocksCleared,
-    BlockRemoved,
-    BlockStored,
+    MEDIUM_GPU,  # GPU存储介质标识
+    AllBlocksCleared,  # 所有块清除事件
+    BlockRemoved,  # 块移除事件
+    BlockStored,  # 块存储事件
 )
+
+# 导入前缀缓存基类和相关数据类型
 from sglang.srt.mem_cache.base_prefix_cache import (
-    BasePrefixCache,
-    EvictParams,
-    EvictResult,
-    InsertParams,
-    InsertResult,
-    MatchPrefixParams,
-    MatchResult,
+    BasePrefixCache,  # 前缀缓存抽象基类
+    EvictParams,  # 驱逐参数
+    EvictResult,  # 驱逐结果
+    InsertParams,  # 插入参数
+    InsertResult,  # 插入结果
+    MatchPrefixParams,  # 前缀匹配参数
+    MatchResult,  # 匹配结果
 )
+
+# 导入驱逐策略实现
 from sglang.srt.mem_cache.evict_policy import (
-    EvictionStrategy,
-    FIFOStrategy,
-    FILOStrategy,
-    LFUStrategy,
-    LRUStrategy,
-    MRUStrategy,
-    PriorityStrategy,
+    EvictionStrategy,  # 驱逐策略基类
+    FIFOStrategy,  # 先进先出策略
+    FILOStrategy,  # 后进先出策略
+    LFUStrategy,  # 最不经常使用策略
+    LRUStrategy,  # 最近最少使用策略
+    MRUStrategy,  # 最近最常使用策略
+    PriorityStrategy,  # 优先级策略
 )
+
+# 导入哈希计算工具
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 
+# 类型检查时导入Req类型，避免运行时循环依赖
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
 class RadixKey:
+    """
+    基数树键(RadixKey) - 表示树节点的键
+
+    基数树中的每个节点都由一个RadixKey标识。RadixKey包含：
+    - token_ids: token ID序列，是该节点存储的实际数据
+    - extra_key: 可选的额外命名空间键，用于区分不同上下文的缓存
+      （例如不同的LoRA适配器、不同的缓存版本等）
+    - is_bigram: 是否为bigram键（用于EAGLE推测解码）
+
+    设计理念：
+    通过extra_key实现命名空间隔离，具有相同token序列但不同extra_key的
+    条目会被存储在不同的子树中，互不干扰。这对于多租户场景和不同模型
+    配置的缓存隔离非常重要。
+    """
+
     def __init__(
         self,
         token_ids: List[int],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
-        # token ids sequence
+        """
+        初始化RadixKey
+
+        Args:
+            token_ids: token ID列表，表示该键对应的token序列
+            extra_key: 可选的额外键，用于命名空间隔离（如LoRA ID、缓存盐值等）
+            is_bigram: 是否为bigram模式的键，用于EAGLE推测解码优化
+        """
+        # token id序列 - 该节点代表的token列表
         self.token_ids = token_ids
-        # extra key (e.g. lora_id, cache_salt)
+        # 额外键 - 用于命名空间隔离，确保不同上下文的缓存互不干扰
         self.extra_key = extra_key
-        # is bigram key
+        # 是否为bigram键 - EAGLE推测解码使用bigram模式
         self.is_bigram = is_bigram
 
     def __len__(self) -> int:
+        """返回token序列的长度"""
         return len(self.token_ids)
 
     def __iter__(self) -> Iterator[int]:
+        """支持迭代，可以遍历token_ids"""
         return iter(self.token_ids)
 
     def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
+        """
+        支持索引和切片操作
+
+        Args:
+            idx: 整数索引或切片对象
+
+        Returns:
+            新的RadixKey对象，包含切片后的token_ids
+        """
         if isinstance(idx, slice):
             return RadixKey(self.token_ids[idx], self.extra_key)
         return RadixKey([self.token_ids[idx]], self.extra_key)
 
     def __repr__(self) -> str:
+        """返回可读的字符串表示，只显示前10个token避免输出过长"""
         preview = self.token_ids[:10]
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
 
 
 class TreeNode:
+    """
+    树节点(TreeNode) - 基数树的基本组成单元
 
+    每个TreeNode代表基数树中的一个节点，存储：
+    - key: 该节点对应的token序列（RadixKey）
+    - value: KV缓存在GPU内存中的索引位置
+    - children: 子节点映射（按token或token块索引）
+    - 元数据：锁引用计数、访问时间、优先级等
+
+    树结构说明：
+    - 根节点：特殊的空节点，key为空列表
+    - 叶节点：没有非evicted子节点的节点
+    - 中间节点：既有父节点又有子节点的节点
+
+    内存管理：
+    - lock_ref: 锁引用计数，>0表示节点正在被使用，不能被驱逐
+    - host_value: 主机（CPU）内存中的KV缓存备份
+    - host_ref_counter: 主机值的引用计数保护
+
+    驱逐策略支持：
+    - last_access_time: 最后访问时间，用于LRU策略
+    - hit_count: 命中次数，用于LFU策略
+    - priority: 优先级，用于优先级驱逐策略
+    """
+
+    # 类级别的计数器，用于生成唯一节点ID
     counter = 0
 
     def __init__(self, id: Optional[int] = None, priority: int = 0):
+        """
+        初始化树节点
+
+        Args:
+            id: 可选的节点ID，如果不提供则自动生成
+            priority: 节点的初始优先级（用于优先级驱逐策略）
+        """
+        # 子节点映射：key -> TreeNode
+        # 使用defaultdict自动创建TreeNode，但通常我们手动设置
         self.children = defaultdict(TreeNode)
+
+        # 父节点引用，构建树的向上遍历路径
         self.parent: TreeNode = None
+
+        # 该节点存储的token序列键
         self.key: RadixKey = None
+
+        # GPU上的KV缓存索引张量
+        # 形状为 [len(key)] 的int64张量，每个元素指向token_to_kv_pool中的位置
         self.value: Optional[torch.Tensor] = None
+
+        # 锁引用计数：
+        # - >0: 节点正在被一个或多个请求使用，不能被驱逐
+        # - =0: 节点未被使用，可以被驱逐（如果是叶节点）
         self.lock_ref = 0
+
+        # 最后访问时间（单调时钟），用于LRU驱逐策略
         self.last_access_time = time.monotonic()
+
+        # 节点创建时间
         self.creation_time = time.monotonic()
 
+        # 命中计数，用于LFU驱逐策略
         self.hit_count = 0
-        # indicating the node is locked to protect from eviction
-        # incremented when the node is referenced by a storage operation
+
+        # 主机引用计数器：保护主机值不被驱逐
+        # 在存储操作引用节点时递增
         self.host_ref_counter = 0
-        # store the host indices of KV cache
+
+        # 主机值：存储在CPU内存中的KV缓存备份
+        # 用于KV缓存卸载(offloading)到CPU内存的场景
         self.host_value: Optional[torch.Tensor] = None
-        # store hash values of each pages
+
+        # 哈希值列表：每个页面一个SHA256哈希
+        # 用于分布式场景下的缓存一致性验证
         self.hash_value: Optional[List[str]] = None
-        # priority for priority-aware eviction
+
+        # 优先级：用于优先级感知的驱逐策略
+        # 较高的优先级意味着节点更不容易被驱逐
         self.priority = priority
 
+        # 分配唯一ID
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
     @property
-    def evicted(self):
+    def evicted(self) -> bool:
+        """
+        检查节点是否已被驱逐
+
+        Returns:
+            True如果节点的value为None（已被驱逐），False否则
+        """
         return self.value is None
 
     @property
-    def backuped(self):
+    def backuped(self) -> bool:
+        """
+        检查节点是否有备份（在CPU内存中）
+
+        Returns:
+            True如果节点有host_value备份，False否则
+        """
         return self.host_value is not None
 
     def protect_host(self):
-        """Protect the host value from eviction."""
+        """
+        保护主机值不被驱逐
+
+        通过递增host_ref_counter来标记主机值正在被使用，
+        防止在存储操作期间被意外释放。
+        """
         self.host_ref_counter += 1
 
     def release_host(self):
-        """Release the host value, allowing it to be evicted."""
+        """
+        释放主机值的保护
+
+        递减host_ref_counter，当计数归零时，主机值可以被驱逐。
+        如果计数已经是0，则抛出运行时错误。
+        """
         if self.host_ref_counter > 0:
             self.host_ref_counter -= 1
         else:
             raise RuntimeError("Host reference counter is already zero.")
 
     def get_last_hash_value(self) -> Optional[str]:
-        """Returns the hash value of the last page in this node."""
+        """
+        获取该节点最后一个页面的哈希值
+
+        Returns:
+            最后一个页面的哈希字符串，如果没有则返回None
+        """
         if self.hash_value is None or len(self.hash_value) == 0:
             return None
         return self.hash_value[-1]
 
     @lru_cache(maxsize=1)
     def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
+        """
+        获取从根节点到当前节点的完整哈希值路径
+
+        Args:
+            node: 当前节点
+
+        Returns:
+            从根到当前节点所有页面的哈希值列表
+        """
         if node is None or node.hash_value is None:
             return []
 
+        # 递归获取父节点的哈希值，然后拼接当前节点的哈希值
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
     def __lt__(self, other: "TreeNode"):
+        """
+        小于比较运算符，用于堆排序
+
+        基于last_access_time比较，较早访问的节点"较小"
+        这在LRU驱逐策略中用于构建最小堆
+        """
         return self.last_access_time < other.last_access_time
 
 
 def _check_extra_key(key0: RadixKey, key1: RadixKey):
+    """
+    检查两个键的extra_key是否一致
+
+    用于确保前缀匹配操作只在相同的命名空间内进行。
+    具有不同extra_key的键永远不应该匹配彼此的前缀。
+
+    Args:
+        key0: 第一个键
+        key1: 第二个键
+
+    Raises:
+        ValueError: 如果两个键的extra_key不同
+    """
     if key0.extra_key != key1.extra_key:
         raise ValueError(
             f"_key_match should be run on the same extra key, but got key0.extra_key={key0.extra_key} != key1.extra_key={key1.extra_key}"
@@ -165,6 +349,19 @@ def _check_extra_key(key0: RadixKey, key1: RadixKey):
 
 
 def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
+    """
+    逐token匹配键（page_size=1的情况）
+
+    找出两个键从开头开始的最长公共前缀长度。
+    当page_size=1时，每个token是一个独立的页面。
+
+    Args:
+        key0: 第一个键
+        key1: 第二个键
+
+    Returns:
+        公共前缀的token数量
+    """
     _check_extra_key(key0, key1)
     i = 0
     for k0, k1 in zip(key0.token_ids, key1.token_ids):
@@ -175,11 +372,28 @@ def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
 
 
 def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
+    """
+    按页面匹配键（page_size>1的情况）
+
+    找出两个键从开头开始的最长公共前缀长度，但匹配必须以页面为单位。
+    如果某个页面的token不完全匹配，则整个页面不算匹配。
+
+    例如：page_size=4时，前4个token必须全部匹配才算第一页匹配。
+
+    Args:
+        key0: 第一个键
+        key1: 第二个键
+        page_size: 页面大小（每个页面包含的token数量）
+
+    Returns:
+        公共前缀的token数量（总是page_size的倍数）
+    """
     _check_extra_key(key0, key1)
     min_len = min(len(key0), len(key1))
 
     i = 0
     while i < min_len:
+        # 每次比较一个完整的页面
         if key0.token_ids[i : i + page_size] != key1.token_ids[i : i + page_size]:
             break
         i += page_size
@@ -188,44 +402,74 @@ def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
 
 
 def get_child_key(key: RadixKey, page_size: int = 1):
+    """
+    获取用于在children字典中索引子节点的键
+
+    根据page_size的不同，生成不同类型的子节点索引键：
+    - page_size=1: 使用单个token ID作为键
+    - page_size>1: 使用token块元组作为键
+
+    如果存在extra_key，则返回(extra_key, plain_key)元组，
+    这样不同命名空间的节点会被正确隔离。
+
+    Args:
+        key: RadixKey对象
+        page_size: 页面大小
+
+    Returns:
+        子节点字典中的键
+    """
     if page_size == 1:
+        # 单token模式：使用第一个token ID
         plain_key = key.token_ids[0]
     else:
+        # 分页模式：使用前page_size个token组成的元组
         plain_key = tuple(key.token_ids[:page_size])
     if key.extra_key is None:
         return plain_key
     else:
+        # 包含命名空间键
         return (key.extra_key, plain_key)
 
 
 def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
-    """Compute SHA256-based hash values for position-aware identification.
+    """
+    计算节点的哈希值列表（用于分布式缓存一致性）
+
+    使用SHA256链式哈希为节点的每个页面计算位置感知的哈希值。
+    每个页面的哈希值依赖于：
+    1. 该页面的token内容
+    2. 前一个页面的哈希值（形成哈希链）
+
+    这种链式哈希确保了相同token在不同位置会产生不同的哈希值，
+    这对于分布式KV缓存的正确性至关重要。
 
     Args:
-        node: The TreeNode to compute hash values for
-        page_size: The page size for chunking tokens
+        node: 要计算哈希的树节点
+        page_size: 页面大小
 
     Returns:
-        List of SHA256 hex strings, one per page
+        每个页面的SHA256哈希字符串列表
     """
     hash_values = []
 
-    # Get parent's last hash value if parent exists
+    # 获取父节点的最后一个哈希值作为起始哈希
     parent_hash = None
     if node.parent is not None and node.parent.hash_value is not None:
-        # Check if parent is root by checking if it has empty key
+        # 检查父节点是否为根节点（根节点key长度为0）
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
 
-    # Iterate through node's pages
+    # 遍历节点的每个页面
     for start in range(0, len(node.key), page_size):
         page_tokens = node.key.token_ids[start : start + page_size]
         if not page_tokens:
             continue
 
-        # Use SHA256-based chaining via get_hash_str
+        # 使用SHA256链式哈希
         hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
         hash_values.append(hash_val)
+        # 当前页面的哈希成为下一个页面的"prior_hash"
         parent_hash = hash_val
 
     return hash_values
@@ -234,24 +478,30 @@ def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
 def split_node_hash_value(
     child_hash_value: Optional[List[str]], split_len: int, page_size: int
 ) -> tuple[Optional[List[str]], Optional[List[str]]]:
-    """Split hash_value between parent and child nodes during node splitting.
+    """
+    在节点分裂时分割哈希值列表
+
+    当一个树节点需要分裂时（匹配过程只匹配了节点部分token），
+    其哈希值也需要相应地分割给新创建的父节点和更新后的子节点。
 
     Args:
-        child_hash_value: The hash_value list from the child node being split
-        split_len: The length at which to split (in tokens)
-        page_size: The page size for calculating number of pages
+        child_hash_value: 原子节点的哈希值列表
+        split_len: 分裂位置的token数量
+        page_size: 页面大小
 
     Returns:
-        Tuple of (new_node_hash_value, updated_child_hash_value)
+        元组：(新父节点的哈希值列表, 更新后子节点的哈希值列表)
     """
     if child_hash_value is None:
         return None, None
 
+    # 计算分割点对应的页面数量
     if page_size == 1:
         split_pages = split_len
     else:
         split_pages = split_len // page_size
 
+    # 分割哈希值列表
     new_node_hash = child_hash_value[:split_pages]
     child_hash = child_hash_value[split_pages:]
 

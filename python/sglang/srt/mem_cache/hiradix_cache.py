@@ -1,3 +1,157 @@
+"""
+hiradix_cache.py - 层次化基数树(Hierarchical Radix Tree)缓存实现
+
+================================================================================
+HiRadixCache vs RadixCache 核心区别
+================================================================================
+
+1. 继承关系：
+   HiRadixCache 继承自 RadixCache，是其层次化扩展版本。
+
+2. 存储层级对比：
+   ┌─────────────────────────────────────────────────────────────────────────┐
+   │  RadixCache (单级存储):                                                 │
+   │  ┌─────────────────┐                                                   │
+   │  │   GPU Memory    │  ← KV Cache 只存在GPU，驱逐时直接删除              │
+   │  └─────────────────┘                                                   │
+   ├─────────────────────────────────────────────────────────────────────────┤
+   │  HiRadixCache (三级层次存储):                                           │
+   │  ┌─────────────────┐                                                   │
+   │  │   L1: GPU       │  ← 热数据，快速访问，容量有限                       │
+   │  ├─────────────────┤                                                   │
+   │  │   L2: CPU Host  │  ← 温数据，中等延迟，容量较大                       │
+   │  ├─────────────────┤                                                   │
+   │  │   L3: Storage   │  ← 冷数据，持久化存储，跨会话共享                   │
+   │  └─────────────────┘                                                   │
+   └─────────────────────────────────────────────────────────────────────────┘
+
+3. 关键特性对比：
+   ┌──────────────────┬────────────────────┬────────────────────────────────┐
+   │      特性         │    RadixCache      │        HiRadixCache            │
+   ├──────────────────┼────────────────────┼────────────────────────────────┤
+   │ 存储层级          │ 单级 (仅GPU)       │ 三级 (GPU→CPU→Storage)         │
+   │ 驱逐目标          │ 直接删除           │ 可驱逐到CPU/存储               │
+   │ 预取机制          │ 无                │ 支持从存储预取                 │
+   │ 写策略            │ 无                │ write_back/write_through       │
+   │ 分布式存储        │ 不支持            │ 支持外部存储后端               │
+   │ 长上下文支持      │ 受GPU内存限制      │ 可卸载到CPU                    │
+   │ 跨会话共享        │ 不支持            │ 支持存储后端                   │
+   └──────────────────┴────────────────────┴────────────────────────────────┘
+
+4. 核心工作流程：
+   - 写入流程: GPU写入 → (可选)写入CPU → (可选)写入存储
+   - 读取流程: 先查GPU → 未命中查CPU → 未命中从存储预取
+   - 驱逐流程: GPU驱逐到CPU → CPU驱逐到存储 → 最终删除
+
+5. 写策略说明：
+   - write_through: 写入GPU时同时写入CPU，适合读多写少场景
+   - write_back: 驱逐时才写入CPU，适合写多读少场景
+   - write_through_selective: 选择性写穿透，根据命中次数决定
+
+6. 适用场景：
+   - RadixCache: 短请求、GPU内存充足、无需持久化
+   - HiRadixCache: 长上下文、多轮对话、跨会话共享、成本敏感
+
+================================================================================
+与 Storage 后端的集成架构
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           HiRadixCache                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                    RadixCache (父类)                                 │  │
+│  │  - 基数树结构管理 (TreeNode, RadixKey)                               │  │
+│  │  - 前缀匹配、插入、驱逐逻辑                                          │  │
+│  │  - L1 (GPU) 内存管理                                                 │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                              │                                              │
+│                              ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                    HiCacheController                                 │  │
+│  │  - 管理GPU↔CPU数据传输                                               │  │
+│  │  - 管理CPU↔Storage数据传输                                           │  │
+│  │  - 异步操作队列和线程管理                                            │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│           │                              │                                  │
+│           ▼                              ▼                                  │
+│  ┌─────────────────┐           ┌─────────────────────────────────────┐   │
+│  │ L2: CPU Host    │           │ L3: Storage Backend                 │   │
+│  │ Memory Pool     │           │ (hicache_storage.py)                │   │
+│  │ (host_value)    │           │                                     │   │
+│  └─────────────────┘           └─────────────────────────────────────┘   │
+│                                              │                              │
+└──────────────────────────────────────────────│──────────────────────────────┘
+                                               │
+                                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     StorageBackendFactory                                   │
+│  - 动态创建和加载存储后端                                                   │
+│  - 支持内置后端和动态加载后端                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                               │
+        ┌──────────────┬──────────────┬────────┴────────┬──────────────┐
+        ▼              ▼              ▼                 ▼              ▼
+┌───────────┐  ┌───────────┐  ┌───────────────┐  ┌───────────┐  ┌───────────┐
+│ HiCache   │  │ HiCache   │  │ MooncakeStore │  │ HiCache   │  │ Aibrix    │
+│ File      │  │ Nixl      │  │               │  │ HF3FS     │  │ KVCache   │
+│ (本地文件) │  │ (NVIDIA)  │  │ (分布式存储)   │  │ (3FS)     │  │ (AIBrix)  │
+└───────────┘  └───────────┘  └───────────────┘  └───────────┘  └───────────┘
+     storage/      storage/      storage/          storage/       storage/
+     hicache_      nixl/         mooncake_store/   hf3fs/         aibrix_kvcache/
+     storage.py    hicache_      mooncake_store.py storage_hf3fs.py aibrix_kvcache
+                   nixl.py                                      _storage.py
+
+================================================================================
+数据流转详解
+================================================================================
+
+写入路径 (Insert):
+─────────────────
+1. 新KV缓存写入GPU (L1)
+   HiRadixCache.insert() → node.value = GPU_indices
+
+2. 根据写策略决定是否写入CPU (L2)
+   - write_through: 立即写入
+   - write_through_selective: 命中阈值后写入
+   - write_back: 驱逐时写入
+   HiRadixCache._inc_hit_count() → write_backup()
+
+3. 可选写入存储后端 (L3)
+   HiRadixCache.write_backup_storage() → storage_backend.set()
+
+读取路径 (Match Prefix):
+────────────────────────
+1. 在基数树中匹配前缀
+   HiRadixCache.match_prefix() → _match_prefix_helper()
+
+2. 检查数据位置
+   - node.value != None: 数据在GPU，直接返回
+   - node.evicted: 数据被驱逐，需要从CPU加载
+
+3. 从CPU加载回GPU
+   HiRadixCache.load_back() → cache_controller.load()
+
+4. 可选：从存储预取到CPU
+   HiRadixCache.prefetch_from_storage() → storage_backend.get()
+
+驱逐路径 (Evict):
+─────────────────
+1. 根据驱逐策略选择节点
+   HiRadixCache.evict() → 从evictable_leaves中选择
+
+2. 处理被选中的节点
+   - 已备份: 只释放GPU内存 (_evict_backuped)
+   - 未备份 + write_back: 先写入CPU再驱逐
+   - 未备份 + 其他策略: 直接释放 (_evict_regular)
+
+3. 更新树结构
+   node.value = None, 保留node.host_value
+
+作者: SGLang Team
+版权所有 2023-2024 SGLang Team
+许可证: Apache License 2.0
+"""
+
 from __future__ import annotations
 
 import atexit
@@ -12,6 +166,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
+# HiCacheController: 管理GPU/CPU/Storage之间的数据移动控制器
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -49,8 +204,66 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
+    """
+    层次化基数树缓存 (Hierarchical Radix Cache)
+
+    继承自 RadixCache，扩展为三级存储架构: GPU → CPU Host → Storage。
+
+    核心概念：
+    ==========
+    1. 三级存储层次：
+       - L1 (GPU): 热数据，延迟最低 (~微秒级)
+       - L2 (CPU Host): 温数据，延迟中等 (~毫秒级)
+       - L3 (Storage): 冷数据，持久化存储 (~秒级)
+
+    2. 数据状态：
+       - 驻留 (resident): 数据在GPU上
+       - 已驱逐 (evicted): 数据被移到CPU，node.value=None
+       - 已备份 (backuped): 数据在CPU有备份，node.host_value不为None
+
+    3. 节点生命周期：
+       ┌──────────┐     驱逐      ┌──────────┐    驱逐     ┌──────────┐
+       │ GPU驻留  │ ─────────────→ │ CPU备份  │ ──────────→ │ Storage  │
+       │ (value)  │                │(host_val)│             │(hash_val)│
+       └──────────┘                └──────────┘             └──────────┘
+            ↑                           ↑                        │
+            │        加载回(load_back)  │       预取(prefetch)   │
+            └───────────────────────────┴────────────────────────┘
+
+    4. 写策略 (write_policy):
+       - write_through: 每次写入GPU时同步写入CPU，保证数据一致性
+       - write_back: 延迟写入，仅在驱逐时写入CPU，减少写入开销
+       - write_through_selective: 根据节点命中次数选择性写穿透
+
+    5. 预取机制 (prefetch):
+       当匹配前缀时，如果发现数据在存储层，可以异步预取到CPU，
+       减少后续请求的延迟。
+
+    属性说明：
+    ==========
+    - token_to_kv_pool_host: CPU内存池，存储被驱逐的KV缓存
+    - cache_controller: 缓存控制器，管理GPU/CPU/Storage之间的数据传输
+    - ongoing_write_through: 正在进行写穿透操作的节点映射
+    - ongoing_load_back: 正在从CPU加载回GPU的节点映射
+    - ongoing_prefetch: 正在从存储预取的请求映射
+    - ongoing_backup: 正在备份到存储的节点映射
+    - evictable_host_leaves: 可以从CPU驱逐的叶子节点集合
+    """
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
+        """
+        初始化层次化基数树缓存
+
+        Args:
+            params: 缓存初始化参数，包含GPU内存池、页面大小等配置
+            server_args: 服务器参数，包含hicache相关配置：
+                - hicache_io_backend: IO后端类型 (direct/standard)
+                - hicache_mem_layout: 内存布局 (page_first/token_first)
+                - hicache_ratio: CPU内存与GPU内存的比例
+                - hicache_size: 指定的CPU内存大小
+                - hicache_write_policy: 写策略
+                - hicache_storage_backend: 存储后端类型 (如nixl, mooncake等)
+        """
         self._enable_metrics_flag = params.enable_metrics
         if server_args.hicache_io_backend == "direct":
             # FIXME: move this logic into server_args parsing
@@ -63,19 +276,28 @@ class HiRadixCache(RadixCache):
         if not server_args.disable_hicache_numa_detect:
             bind_to_closest_numa_node_cuda()
 
+        # 页面大小，决定了KV缓存分配和匹配的基本单位
         self.page_size = params.page_size
+        # 获取GPU上的KV缓存池
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        # =========================================================================
+        # L2层: CPU Host 内存池初始化
+        # 根据GPU缓存池的类型创建对应的CPU内存池
+        # CPU内存池用于存储被驱逐的KV缓存，实现GPU到CPU的offloading
+        # =========================================================================
         if isinstance(self.kv_cache, MHATokenToKVPool):
+            # Multi-Head Attention 的 CPU 内存池
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                server_args.hicache_ratio,      # CPU/GPU内存比例
+                server_args.hicache_size,       # 指定的CPU内存大小
                 self.page_size,
-                server_args.hicache_mem_layout,
+                server_args.hicache_mem_layout, # 内存布局方式
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
+            # Native Sparse Attention 的 CPU 内存池
             self.token_to_kv_pool_host = NSATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -85,6 +307,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
+            # Multi-Latent Attention 的 CPU 内存池
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -96,10 +319,20 @@ class HiRadixCache(RadixCache):
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
+        # =========================================================================
+        # 分布式训练相关配置
+        # =========================================================================
+        # 张量并行组，用于TP workers之间的同步
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        # 流水线并行的rank和size
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
+
+        # =========================================================================
+        # L3层: 存储后端配置
+        # =========================================================================
+        # 是否启用外部存储后端 (如NIXL, Mooncake等)
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
@@ -114,19 +347,27 @@ class HiRadixCache(RadixCache):
             server_args.hicache_storage_backend_extra_config
         )
         # TODO: support more timeout check functions
+        # 预取超时检查函数，使用线性超时策略
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
+        # 预取停止策略: best_effort/wait_complete/timeout
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        # 用于同步KV缓存加载的事件
         self.load_cache_event = threading.Event()
+
+        # =========================================================================
+        # 核心组件: 缓存控制器
+        # 管理GPU/CPU/Storage之间的所有数据移动操作
+        # =========================================================================
         self.cache_controller = HiCacheController(
-            params.token_to_kv_pool_allocator,
-            self.token_to_kv_pool_host,
+            params.token_to_kv_pool_allocator,  # GPU内存分配器
+            self.token_to_kv_pool_host,          # CPU内存池
             self.page_size,
             self.tp_group,
             load_cache_event=self.load_cache_event,
-            write_policy=server_args.hicache_write_policy,
-            io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
+            write_policy=server_args.hicache_write_policy,  # 写策略
+            io_backend=server_args.hicache_io_backend,      # IO后端
+            storage_backend=server_args.hicache_storage_backend,  # 存储后端
             prefetch_threshold=prefetch_threshold,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
@@ -144,34 +385,61 @@ class HiRadixCache(RadixCache):
             extra_metric_labels=self.extra_metric_labels,
         )
 
-        # record the nodes with ongoing write through
+        # =========================================================================
+        # 数据传输状态跟踪
+        # 这些字典跟踪正在进行中的异步数据传输操作
+        # =========================================================================
+        # 记录正在进行写穿透(write-through)操作的节点
+        # key: node.id, value: TreeNode
+        # 用于确保写操作完成后再释放锁
         self.ongoing_write_through = {}
-        # record the node segments with ongoing load back
+
+        # 记录正在从CPU加载回GPU的节点段
+        # key: node.id, value: TreeNode
+        # 用于跟踪异步加载操作，防止重复加载
         self.ongoing_load_back = {}
-        # record the ongoing prefetch requests
+
+        # 记录正在进行的预取请求
+        # key: request_id, value: (last_host_node, token_ids, host_indices, operation)
+        # 预取是从存储层异步加载KV缓存到CPU的过程
         self.ongoing_prefetch = {}
+
+        # 记录正在备份到存储的节点
+        # key: operation_id, value: TreeNode
         self.ongoing_backup = {}
-        # track per-request tokens loaded from storage (L3 hits)
-        # key: request_id, value: number of tokens actually loaded from storage
+
+        # 跟踪每个请求从存储加载的token数量 (L3命中)
+        # key: request_id, value: 实际从存储加载的token数量
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
-        # todo: dynamically adjust the threshold
+
+        # =========================================================================
+        # 阈值配置
+        # =========================================================================
+        # 写穿透阈值: 节点被访问几次后触发写入CPU
+        # write_through策略时阈值为1，write_back策略时阈值为2
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
+        # 加载回阈值: 从CPU加载回GPU的最小token数量
+        # 避免小块数据的频繁传输开销
         self.load_back_threshold = 10
 
-        # Detach storage backend automatically on process shutdown
+        # 进程退出时自动分离存储后端
         atexit.register(self.shutdown)
 
+        # 可从CPU驱逐的叶子节点集合
+        # 与evictable_leaves类似，但针对CPU内存
         self.evictable_host_leaves = set()
 
+        # 调用父类RadixCache的初始化
         super().__init__(params=params)
 
     def shutdown(self):
-        """Best-effort auto-detach of storage backend on process shutdown.
+        """
+        进程关闭时自动分离存储后端
 
-        This keeps startup and runtime behavior consistent: if a backend was attached
-        (either via CLI args or via admin API), we attempt to detach it on exit.
+        在进程退出时自动调用（通过atexit注册），确保存储后端正确清理。
+        这是一个尽力而为的操作，即使失败也不会导致程序崩溃。
         """
         try:
             if self.enable_storage:
@@ -233,11 +501,27 @@ class HiRadixCache(RadixCache):
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
-        """Attach (enable) storage backend at runtime.
+        """
+        运行时动态附加（启用）存储后端
 
-        This will start storage threads inside `HiCacheController` and enable
-        prefetch/backup paths. Caller must ensure there are no running/queued
-        requests to avoid races.
+        这将启动HiCacheController内部的存储线程，并启用预取/备份路径。
+        调用者必须确保没有正在运行/排队的请求以避免竞争条件。
+
+        Args:
+            storage_backend: 存储后端类型（如 'nixl', 'mooncake' 等）
+            storage_backend_extra_config_json: 存储后端额外配置的JSON字符串
+            served_model_name: 服务的模型名称
+            hicache_storage_prefetch_policy: 预取停止策略
+                - 'best_effort': 尽力而为，可随时终止
+                - 'wait_complete': 等待完成
+                - 'timeout': 超时后终止
+            hicache_write_policy: 写策略
+                - 'write_back': 驱逐时写入
+                - 'write_through': 同步写入
+                - 'write_through_selective': 选择性写入
+
+        Returns:
+            tuple[bool, str]: (是否成功, 消息)
         """
         # Validate inputs first (no side effects).
         if hicache_storage_prefetch_policy is not None:
@@ -345,9 +629,19 @@ class HiRadixCache(RadixCache):
         return True, "Attached HiCache storage backend successfully."
 
     def detach_storage_backend(self) -> tuple[bool, str]:
-        """Detach (disable) storage backend at runtime.
+        """
+        运行时动态分离（禁用）存储后端
 
-        Caller must ensure there are no running/queued requests to avoid races.
+        调用者必须确保没有正在运行/排队的请求以避免竞争条件。
+
+        分离过程：
+        1. 排空存储控制队列
+        2. 停止存储线程
+        3. 强制释放所有待处理的操作
+        4. 更新状态标志
+
+        Returns:
+            tuple[bool, str]: (是否成功, 消息)
         """
         try:
             # Drain any pending control queues before tearing down storage threads/backend.
@@ -374,11 +668,15 @@ class HiRadixCache(RadixCache):
         return True, "Detached HiCache storage backend successfully."
 
     def _force_release_pending_storage_ops(self):
-        """Force release any leftover pending prefetch/backup bookkeeping.
+        """
+        强制释放所有待处理的预取/备份操作
 
-        This is a safety net for detach/shutdown paths. It assumes storage threads
-        have been stopped already (via controller.detach), so no concurrent access
-        to these structures should happen.
+        这是detach/shutdown路径的安全网。假设存储线程已经停止，
+        所以不会有对这些结构的并发访问。
+
+        处理流程：
+        1. 释放所有待处理预取操作的主机页和锁
+        2. 释放所有待处理备份操作的节点保护
         """
         cc = self.cache_controller
 
@@ -613,11 +911,30 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
+        """
+        将GPU上的KV缓存备份到CPU内存
+
+        这是L1→L2的数据传输过程。当GPU内存不足或节点命中次数达到阈值时调用。
+
+        工作流程：
+        1. 在CPU内存池中分配空间
+        2. 如果CPU内存不足，先驱逐CPU中的旧数据
+        3. 将GPU数据拷贝到CPU
+        4. 记录到ongoing_write_through以跟踪异步操作
+
+        Args:
+            node: 要备份的树节点
+            write_back: 是否为write_back策略（驱逐时的备份）
+
+        Returns:
+            备份的token数量，如果失败返回0
+        """
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
         )
         if host_indices is None:
+            # CPU内存不足，先驱逐一些旧数据
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
@@ -628,7 +945,7 @@ class HiRadixCache(RadixCache):
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
-                # no need to lock nodes if write back
+                # write_through策略需要增加锁引用计数保护节点
                 self.inc_lock_ref(node)
         else:
             return 0
@@ -636,6 +953,23 @@ class HiRadixCache(RadixCache):
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode):
+        """
+        将CPU内存中的KV缓存备份到外部存储后端 (L2→L3)
+
+        这是L2→L3的数据传输过程。当启用storage backend时，
+        可以将CPU数据持久化到外部存储系统，实现跨会话共享。
+
+        支持的存储后端：
+        - file: 本地文件系统存储
+        - nixl: NVIDIA NIXL存储
+        - mooncake: Mooncake分布式存储
+        - hf3fs: 3FS高性能存储
+        - aibrix: AIBrix KV Cache存储
+        - eic: EIC存储
+
+        Args:
+            node: 要备份到存储的树节点，必须有host_value
+        """
         prefix_keys = (
             node.get_prefix_hash_values(node.parent)
             if self.hicache_storage_pass_prefix_keys
@@ -649,6 +983,18 @@ class HiRadixCache(RadixCache):
         node.protect_host()
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
+        """
+        增加节点命中计数，并在达到阈值时触发写穿透
+
+        这是write_through_selective策略的核心逻辑：
+        - 只有当节点被访问足够多次时才写入CPU
+        - 避免冷数据占用CPU内存
+        - 写回策略(write_back)跳过此逻辑
+
+        Args:
+            node: 被访问的树节点
+            chunked: 是否为分块请求（分块请求不更新计数）
+        """
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
             return
@@ -660,6 +1006,26 @@ class HiRadixCache(RadixCache):
                 self.write_backup(node)
 
     def writing_check(self, write_back=False):
+        """
+        检查并处理正在进行的写操作
+
+        这个方法协调GPU→CPU的异步数据传输：
+        1. 检查CUDA事件是否完成
+        2. 在TP workers之间同步完成状态
+        3. 更新节点状态并触发存储备份
+
+        对于write_back策略：
+        - 阻塞等待所有写操作完成
+        - 确保数据安全后再进行驱逐
+
+        对于write_through策略：
+        - 非阻塞检查已完成的事件
+        - 释放锁引用计数
+        - 触发存储备份
+
+        Args:
+            write_back: 是否为write_back策略的阻塞检查
+        """
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
@@ -772,6 +1138,28 @@ class HiRadixCache(RadixCache):
             self.evictable_host_leaves.add(node)
 
     def evict(self, params: EvictParams) -> EvictResult:
+        """
+        驱逐GPU上的KV缓存
+
+        这是层次化缓存的核心驱逐逻辑，与RadixCache的主要区别：
+        1. 支持将被驱逐数据写入CPU (write_back策略)
+        2. 已备份的节点只释放GPU内存，保留CPU备份
+        3. 驱逐后检查写入完成状态
+
+        驱逐优先级由eviction_strategy决定：
+        - LRU: 最近最少使用
+        - LFU: 最不经常使用
+        - FIFO: 先进先出
+        - MRU: 最近最常使用
+        - FILO: 后进先出
+        - Priority: 优先级
+
+        Args:
+            params: 驱逐参数，包含要驱逐的token数量
+
+        Returns:
+            EvictResult: 驱逐结果，包含实际驱逐的token数量
+        """
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
@@ -818,11 +1206,28 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
+        """
+        驱逐已备份到CPU的节点 (只释放GPU内存)
+
+        这是L1→L2驱逐的完成阶段。节点已经在CPU有备份，
+        只需要释放GPU上的内存，CPU数据保留以备后续加载回。
+
+        处理流程：
+        1. 释放GPU内存 (value置None)
+        2. 更新evictable_size统计
+        3. 更新节点和父节点的叶子状态
+
+        Args:
+            node: 已备份的树节点
+
+        Returns:
+            释放的token数量
+        """
         # evict a node already written to host
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
-        node.value = None
+        node.value = None  # GPU值置空，但host_value保留
         self._update_leaf_status(node)
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
@@ -872,7 +1277,25 @@ class HiRadixCache(RadixCache):
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
-        # todo: more loading policies
+        """
+        从CPU内存加载KV缓存回GPU (L2→L1)
+
+        当匹配前缀时发现节点已被驱逐到CPU，调用此方法将数据加载回GPU。
+        这是CPU到GPU的反向数据传输。
+
+        工作流程：
+        1. 从被驱逐节点向上遍历，收集所有需要加载的节点
+        2. 检查是否满足加载条件（大小阈值、内存配额）
+        3. 分配GPU内存并执行异步传输
+        4. 更新节点状态和锁引用计数
+
+        Args:
+            node: 起始节点（通常是被驱逐的叶子节点）
+            mem_quota: 可用的GPU内存配额
+
+        Returns:
+            加载的GPU索引张量，如果加载失败返回None
+        """
 
         start_time = time.perf_counter()
         last_hit_node = node
